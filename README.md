@@ -26,7 +26,7 @@ docker run -d \
   bootramp/pingpilot-web:latest
 ```
 
-Open `http://SERVER-IP:219`.
+Open `http://SERVER-IP:8219`.
 
 If a hardened Docker installation strips ICMP permissions, append `--cap-add=NET_RAW` to the `docker run` command.
 
@@ -37,7 +37,7 @@ docker build -t pingpilot-web:latest .
 docker compose up -d --build
 ```
 
-Set `PINGPILOT_PORT` before using Compose when a port other than `219` is needed.
+Set `PINGPILOT_PORT` before using Compose when a port other than `8219` is needed.
 
 ## Persistent data and privacy
 
