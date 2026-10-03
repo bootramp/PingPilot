@@ -21,7 +21,7 @@ docker pull bootramp/pingpilot-web:latest
 docker run -d \
   --name pingpilot-web \
   --restart unless-stopped \
-  -p 219:8219 \
+  -p 8219:8219 \
   -v pingpilot_data:/data \
   bootramp/pingpilot-web:latest
 ```
