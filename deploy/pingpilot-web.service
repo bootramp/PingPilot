@@ -1,0 +1,23 @@
+[Unit]
+Description=PingPilot Web Monitoring
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/pingpilot-web
+Environment=PINGPILOT_DATA=/opt/pingpilot-web/data
+ExecStart=/opt/pingpilot-web/venv/bin/gunicorn --workers 1 --threads 8 --bind 127.0.0.1:8219 --timeout 90 --access-logfile - --error-logfile - app:app
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/pingpilot-web/data
+
+[Install]
+WantedBy=multi-user.target
