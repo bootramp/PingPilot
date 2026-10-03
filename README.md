@@ -1,3 +1,5 @@
+<img width="1672" height="941" alt="pingpilot-hero-v2" src="https://github.com/user-attachments/assets/0cb7f407-0b8d-4f2f-add9-1001efaaaa31" />
+
 # PingPilot Web
 
 PingPilot Web is a self-hosted monitoring dashboard for Linux. It monitors ICMP, TCP, HTTP/HTTPS, DNS and other configured targets, provides live operational dashboards, Global Connectivity checks, network tools, reports, and Rocket.Chat notifications.
