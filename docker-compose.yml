@@ -5,7 +5,7 @@ services:
     container_name: pingpilot-web
     restart: unless-stopped
     ports:
-      - "${PINGPILOT_PORT:-219}:8219"
+      - "${PINGPILOT_PORT:-8219}:8219"
     volumes:
       - pingpilot_data:/data
     cap_add:
