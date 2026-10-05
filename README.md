@@ -22,6 +22,7 @@ docker run -d \
   --name pingpilot-web \
   --restart unless-stopped \
   -p 8219:8219 \
+  --cap-add=NET_RAW \
   -v pingpilot_data:/data \
   bootramp/pingpilot-web:latest
 ```
