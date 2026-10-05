@@ -14,7 +14,7 @@ Run this from the pingpilot-web directory:
 
 Only choose the host port. For example, to use port 219:
 
-    docker run -d --name pingpilot-web --restart unless-stopped -p 8219:8219 -v pingpilot_data:/data pingpilot-web:latest
+    docker run -d --name pingpilot-web --restart unless-stopped -p 8219:8219 --cap-add=NET_RAW -v pingpilot_data:/data pingpilot-web:latest
 
 Open http://SERVER-IP:8219.
 
@@ -34,7 +34,7 @@ Build the image once on any Docker machine, then export it:
 Copy pingpilot-web.tar to another server and load it there:
 
     docker load -i pingpilot-web.tar
-    docker run -d --name pingpilot-web --restart unless-stopped -p 8219:8219 -v pingpilot_data:/data pingpilot-web:latest
+    docker run -d --name pingpilot-web --restart unless-stopped -p 8219:8219 --cap-add=NET_RAW -v pingpilot_data:/data pingpilot-web:latest
 
 ## Data and secrets
 
@@ -53,6 +53,6 @@ pingpilot_data; do not copy it into the image.
 
     docker build -t pingpilot-web:latest .
     docker rm -f pingpilot-web
-    docker run -d --name pingpilot-web --restart unless-stopped -p 8219:8219 -v pingpilot_data:/data pingpilot-web:latest
+    docker run -d --name pingpilot-web --restart unless-stopped -p 8219:8219 --cap-add=NET_RAW -v pingpilot_data:/data pingpilot-web:latest
 
 The named volume preserves runtime state across image upgrades.
