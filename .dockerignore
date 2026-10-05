@@ -1,0 +1,19 @@
+# Never bake runtime state, monitoring history, or secrets into an image.
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.key
+.env
+.pingpilot_askpass.cmd
+
+# Local-only artifacts.
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+outage-timeline-preview.png
+deploy/
+Dockerfile*
+docker-compose*.yml
+README.Docker.md
