@@ -1,5 +1,9 @@
 import csv, io, ipaddress, json, math, os, re, shutil, socket, sqlite3, ssl, struct, subprocess, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+try:
+ import fcntl
+except ImportError:
+ fcntl=None
 from datetime import datetime, timedelta, timezone
 from cryptography.fernet import Fernet, InvalidToken
 from flask import Flask, Response, jsonify, render_template, request
@@ -10,7 +14,7 @@ ROOT=os.path.dirname(os.path.abspath(__file__)); DATA=os.environ.get("PINGPILOT_
 app=Flask(__name__); app.config["JSON_SORT_KEYS"]=False
 LOCK,RUN=threading.RLock(),threading.Lock(); STATE={"running":False,"paused":False,"started_at":None,"cycle_active":False,"elapsed_base":0,"last_resume_at":None,"last_hourly_report_at":None,"last_hourly_attempt_at":None}; STOP=threading.Event()
 PROTOCOLS={"PING":None,"TCP":None,"UDP":None,"HTTP":80,"HTTPS":443,"DNS":53,"SSH":22,"TELNET":23,"FTP":21,"SMB":445,"RDP":3389,"SQL SERVER":1433,"TFTP":69,"SNMP":161}; TCP={"TCP","SSH","TELNET","FTP","SMB","RDP","SQL SERVER"}; UDP={"UDP","TFTP","SNMP"}; HOST=re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$")
-GLOBAL_RUN=threading.Lock()
+GLOBAL_RUN=threading.Lock();SCHEDULER_LOCK_HANDLE=None
 GLOBAL_DEFAULTS=[
  ("United States","US","Google","https://www.google.com","HTTPS",443),
  ("United Kingdom","GB","BBC","https://www.bbc.co.uk","HTTPS",443),
@@ -205,6 +209,19 @@ def global_scheduler():
   # not block the next tick; overlapping full passes are still prevented.
   if not GLOBAL_RUN.locked():threading.Thread(target=global_cycle,name="pingpilot-global-cycle",daemon=True).start()
   STOP.wait(1)
+def start_background_services():
+ global SCHEDULER_LOCK_HANDLE
+ lock_path=os.path.join(DATA,'.scheduler.lock')
+ try:
+  handle=open(lock_path,'a+')
+  if fcntl:fcntl.flock(handle.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+  SCHEDULER_LOCK_HANDLE=handle
+ except (OSError,BlockingIOError):
+  app.logger.warning('Scheduler already owned by another PingPilot process; this worker will serve HTTP only')
+  return False
+ threading.Thread(target=scheduler,name='pingpilot-scheduler',daemon=True).start()
+ threading.Thread(target=global_scheduler,name='pingpilot-global-scheduler',daemon=True).start()
+ return True
 def dns(srv,port,domain,timeout):
  try:ipaddress.ip_address(srv.strip("[]"))
  except:return False,None,"DNS requires the DNS server IP address"
@@ -232,6 +249,15 @@ def udp(host,port,timeout,label):
  except socket.timeout:return False,None,"%s packet sent; no response (health not confirmed)"%label
  except OSError as e:return False,None,"UDP network error: %s"%e
 def icmp(host,timeout):
+ target=host.strip('[]');wait=max(1,int(math.ceil(timeout)));ping=shutil.which('ping') or '/usr/bin/ping';started=time.perf_counter()
+ try:
+  result=subprocess.run([ping,'-6' if ':' in target else '-4','-n','-c','1','-W',str(wait),target],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=wait+2,env={'PATH':os.environ.get('PATH','/usr/sbin:/usr/bin:/sbin:/bin'),'LANG':'C.UTF-8'})
+  elapsed=(time.perf_counter()-started)*1000
+  if result.returncode==0:return True,elapsed,'ICMP reply'
+  lines=(result.stdout or 'ICMP failed').strip().splitlines();return False,elapsed,lines[-1] if lines else 'ICMP failed'
+ except FileNotFoundError:return False,None,'ICMP ping utility is not installed'
+ except subprocess.TimeoutExpired:return False,None,'ICMP timeout'
+ except Exception as e:return False,None,'ICMP error: %s'%e
  t=time.perf_counter()
  try:
   x=subprocess.run(["/bin/ping","-6" if ":" in host else "-4","-n","-c","1","-W",str(max(1,int(timeout))),host.strip("[]")],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=timeout+2)
@@ -388,6 +414,108 @@ def tool_host(value):
  host=(parsed.hostname or "").strip("[]")
  if not host or not HOST.match(host):raise ValueError("Enter a valid hostname or IP address")
  return host
+def tool_url(value):
+ pass
+def speed_target(value,scheme):
+ raw=str(value or '').strip();scheme=str(scheme or 'http').lower()
+ if scheme not in {'http','https'}:raise ValueError('Speed test scheme must be HTTP or HTTPS')
+ if '://' not in raw:raw=scheme+'://'+raw
+ parsed=urllib.parse.urlparse(raw);host=(parsed.hostname or '').strip('[]')
+ if parsed.scheme not in {'http','https'} or not parsed.netloc or parsed.username or parsed.password or not host or not HOST.match(host):raise ValueError('Enter a valid URL, hostname, or IP address')
+ return raw
+def speed_quality(bytes_per_second,complete):
+ if not complete:return 'Not rated - the destination returned less data than requested'
+ mbps=bytes_per_second*8/1000000
+ if mbps<1:return 'Poor - below 1 Mbps'
+ if mbps<5:return 'Limited - 1 to 5 Mbps'
+ if mbps<25:return 'Good - 5 to 25 Mbps'
+ if mbps<100:return 'Very good - 25 to 100 Mbps'
+ return 'Excellent - 100 Mbps or higher'
+ raw=str(value or "").strip();parsed=urllib.parse.urlparse(raw)
+ if parsed.scheme not in {"http","https"} or not parsed.netloc or parsed.username or parsed.password:raise ValueError("Destination must be a plain http:// or https:// URL")
+ host=(parsed.hostname or "").strip("[]")
+ if not host or not HOST.match(host):raise ValueError("Enter a valid destination hostname or IP address")
+ return raw
+def speed_test(url,mode,download_bytes,upload_bytes,timeout):
+ pass
+def speed_test_v2(url,mode,size_bytes,timeout):
+ result={'target':url,'mode':mode,'requested_bytes':size_bytes,'download_bytes':0,'upload_bytes':0,'download_elapsed_ms':None,'upload_elapsed_ms':None,'download_bytes_per_second':0,'upload_bytes_per_second':0,'download_status':None,'upload_status':None,'upload_method':None,'download_error':None,'upload_error':None,'errors':[]}
+ context=ssl.create_default_context()
+ def rate(amount,elapsed):return amount/max(elapsed,0.000001)
+ if mode in {'download','both'}:
+  started=time.perf_counter()
+  try:
+   request_obj=urllib.request.Request(url,headers={'User-Agent':'PingPilot-Web/2.1','Range':'bytes=0-%d'%(size_bytes-1)})
+   with urllib.request.urlopen(request_obj,timeout=timeout,context=context) as response:
+    result['download_status']=response.getcode();remaining=size_bytes
+    while remaining>0:
+     chunk=response.read(min(1024*1024,remaining))
+     if not chunk:break
+     result['download_bytes']+=len(chunk);remaining-=len(chunk)
+   elapsed=time.perf_counter()-started;result['download_elapsed_ms']=round(elapsed*1000,2);result['download_bytes_per_second']=round(rate(result['download_bytes'],elapsed),2)
+  except urllib.error.HTTPError as error:
+   result['download_error']='HTTP %s'%error.code;result['errors'].append('Download failed: '+result['download_error'])
+  except Exception as error:
+   result['download_error']=str(error);result['errors'].append('Download failed: '+result['download_error'])
+ if mode in {'upload','both'}:
+  started=time.perf_counter();body=os.urandom(size_bytes);upload_error=None
+  for method in ('POST','PUT'):
+   try:
+    request_obj=urllib.request.Request(url,data=body,method=method,headers={'User-Agent':'PingPilot-Web/2.1','Content-Type':'application/octet-stream','Content-Length':str(size_bytes)})
+    with urllib.request.urlopen(request_obj,timeout=timeout,context=context) as response:response.read(4096);result['upload_status']=response.getcode();result['upload_method']=method
+    elapsed=time.perf_counter()-started;result['upload_bytes']=size_bytes;result['upload_elapsed_ms']=round(elapsed*1000,2);result['upload_bytes_per_second']=round(rate(size_bytes,elapsed),2);break
+   except urllib.error.HTTPError as error:
+    upload_error='HTTP %s via %s'%(error.code,method)
+    result['upload_error']=upload_error;result['upload_method']=method
+    if error.code not in {405,501}:break
+   except Exception as error:
+    upload_error=str(error);result['upload_error']=upload_error;result['upload_method']=method;break
+  if result['upload_status'] is None:result['errors'].append('Upload failed: %s. The destination must accept HTTP POST or PUT with an octet-stream body.'%(upload_error or 'destination rejected the request'))
+ def leg(title,amount,elapsed,status,method=None,error=None):
+  if elapsed is None:return [title,'  Status: '+(('Rejected - '+error) if error else 'not run')]
+  throughput=amount/max(elapsed/1000,0.000001);mbps=throughput*8/1000000;complete=amount>=size_bytes;status_text='HTTP %s'%status if status is not None else 'no HTTP response'
+  if method:status_text+=' via '+method
+  return [title,'  Status: '+status_text,'  Transferred: %.2f MB / %.2f MB'%(amount/1048576,size_bytes/1048576),'  Throughput: %.2f MB/s (%.2f Mbps)'%(throughput/1048576,mbps),'  Elapsed: %.2f ms'%elapsed,'  Quality: '+speed_quality(throughput,complete)]
+ display_mode={'download':'Download','upload':'Upload','both':'Download + Upload'}[mode]
+ lines=['PINGPILOT SPEED TEST','========================================','Target: '+url,'Mode: '+display_mode,'Test size: %.2f MB (%d bytes)'%(size_bytes/1048576,size_bytes),'',*leg('DOWNLOAD',result['download_bytes'],result['download_elapsed_ms'],result['download_status'],error=result['download_error']),'',*leg('UPLOAD',result['upload_bytes'],result['upload_elapsed_ms'],result['upload_status'],result['upload_method'],result['upload_error'])]
+ if result['errors']:lines+=['','NOTES:']+['  - '+error for error in result['errors']]+['','RESULT: Completed with the notes above.']
+ else:lines+=['','RESULT: Completed successfully.']
+ lines+=['Quality is an indicative HTTP throughput rating; the destination server can limit the measured speed.']
+ result['output']='\n'.join(lines);return result
+ result={"target":url,"mode":mode,"download_requested_bytes":download_bytes,"upload_requested_bytes":upload_bytes,"download_bytes":0,"upload_bytes":0,"download_elapsed_ms":None,"upload_elapsed_ms":None,"download_bytes_per_second":0,"upload_bytes_per_second":0,"download_status":None,"upload_status":None,"errors":[]}
+ def rate(n,elapsed):return round(n/max(elapsed,0.000001),2)
+ if mode in {"download","both"}:
+  started=time.perf_counter()
+  try:
+   req=urllib.request.Request(url,headers={"User-Agent":"PingPilot-Web/2.0","Range":"bytes=0-%d"%(download_bytes-1)})
+   with urllib.request.urlopen(req,timeout=timeout,context=ssl.create_default_context()) as response:
+    result["download_status"]=response.getcode();remaining=download_bytes
+    while remaining>0:
+     chunk=response.read(min(1024*1024,remaining))
+     if not chunk:break
+     result["download_bytes"]+=len(chunk);remaining-=len(chunk)
+   elapsed=time.perf_counter()-started;result["download_elapsed_ms"]=round(elapsed*1000,2);result["download_bytes_per_second"]=rate(result["download_bytes"],elapsed)
+  except Exception as e:result["errors"].append("Download: %s"%e)
+ if mode in {"upload","both"}:
+  started=time.perf_counter()
+  body=os.urandom(upload_bytes);upload_error=None
+  for method in ("POST","PUT"):
+   try:
+    req=urllib.request.Request(url,data=body,method=method,headers={"User-Agent":"PingPilot-Web/2.0","Content-Type":"application/octet-stream","Content-Length":str(upload_bytes)})
+    with urllib.request.urlopen(req,timeout=timeout,context=ssl.create_default_context()) as response:response.read(4096);result["upload_status"]=response.getcode();result["upload_method"]=method
+    elapsed=time.perf_counter()-started;result["upload_bytes"]=upload_bytes;result["upload_elapsed_ms"]=round(elapsed*1000,2);result["upload_bytes_per_second"]=rate(upload_bytes,elapsed);break
+   except urllib.error.HTTPError as e:
+    upload_error="HTTP %s via %s"%(e.code,method)
+    if e.code not in {405,501}:break
+   except Exception as e:upload_error=str(e);break
+  if not result["upload_status"]:result["errors"].append("Upload failed: %s. The destination must accept HTTP POST or PUT with an octet-stream body."%(upload_error or "destination rejected the request"))
+ def line_bytes(n):return "%d bytes/s"%round(n)
+ lines=["Speed test target: %s"%url,"Mode: %s"%mode,"Download: %d / %d bytes · %s · %s"%(result["download_bytes"],download_bytes,line_bytes(result["download_bytes_per_second"]),("HTTP %s"%result["download_status"] if result["download_status"] else "not run")),"Upload: %d / %d bytes · %s · %s"%(result["upload_bytes"],upload_bytes,line_bytes(result["upload_bytes_per_second"]),("HTTP %s"%result["upload_status"] if result["upload_status"] else "not run"))]
+ if result["download_elapsed_ms"] is not None:lines.append("Download elapsed: %.2f ms"%result["download_elapsed_ms"])
+ if result["upload_elapsed_ms"] is not None:lines.append("Upload elapsed: %.2f ms"%result["upload_elapsed_ms"])
+ if result["errors"]:lines.extend(["","Errors:"]+result["errors"])
+ else:lines.append("Completed successfully.")
+ result["output"]="\n".join(lines);return result
 def tool_run(args,timeout=18):
  try:
   result=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=timeout,env={"PATH":os.environ.get("PATH","/usr/sbin:/usr/bin:/sbin:/bin"),"LANG":"C.UTF-8"})
@@ -455,8 +583,24 @@ def tool_nmap():
   output="Requested target: %s\nResolved IPv4: %s\nScan profile: TCP connect · %s\n\n%s"%(host,scan_target,scope_name,tool_run(args,limit+10))
   response=jsonify({"ok":True,"target":host,"resolved_address":scan_target,"scope":scope,"output":output});response.headers["Cache-Control"]="no-store";return response
  except ValueError as e:return jsonify({"error":str(e)}),400
+@app.post("/api/tools/speedtest")
+def tool_speedtest():
+ try:
+  data=request.get_json(force=True) or {};url=speed_target(data.get('target',data.get('url')),data.get('scheme','http'));mode=str(data.get('mode','download')).lower()
+  if mode not in {'download','upload','both'}:raise ValueError('Invalid speed test mode')
+  size_mb=max(1,min(64,float(data.get('size_mb',4))));size_bytes=min(64*1024*1024,int(size_mb*1024*1024));timeout=max(3,min(30,float(data.get('timeout_seconds',15))))
+  result=speed_test_v2(url,mode,size_bytes,timeout);response=jsonify({'ok':not result['errors'],**result});response.headers['Cache-Control']='no-store';return response
+ except ValueError as error:return jsonify({'error':str(error)}),400
+ try:
+  data=request.get_json(force=True) or {};url=tool_url(data.get("url"));mode=str(data.get("mode","download")).lower()
+  if mode not in {"download","upload","both"}:raise ValueError("Invalid speed test mode")
+  size_mb=max(1,min(64,float(data.get("size_mb",4))))
+  download_bytes=min(64*1024*1024,int(size_mb*1024*1024));upload_bytes=min(64*1024*1024,int(size_mb*1024*1024))
+  timeout=max(3,min(30,float(data.get("timeout_seconds",15))))
+  result=speed_test(url,mode,download_bytes,upload_bytes,timeout);response=jsonify({"ok":not result["errors"],**result});response.headers["Cache-Control"]="no-store";return response, (200 if not result["errors"] else 502)
+ except (ValueError,TypeError) as e:return jsonify({"error":str(e)}),400
 @app.get("/api/tools/status")
-def tool_status():return jsonify({"nslookup":bool(shutil.which("nslookup")),"nmap":bool(shutil.which("nmap")),"note":"Commands use fixed safe arguments, timeouts, and do not execute a user-provided shell command."})
+def tool_status():return jsonify({"nslookup":bool(shutil.which("nslookup")),"nmap":bool(shutil.which("nmap")),"speedtest":True,"note":"Commands use fixed safe arguments, byte limits, timeouts, and do not execute a user-provided shell command."})
 @app.get("/")
 def index():return render_template("index.html",protocols=list(PROTOCOLS))
 @app.get("/api/state")
@@ -598,5 +742,5 @@ def export():
  o=io.StringIO();w=csv.writer(o);w.writerow(["Name","Host / URL","Port","Protocol","Enabled","Rocket Alert","Status","Detail","OK","Fail","Availability","Last latency (ms)","Updated"])
  for t in map(serial,all_targets()):w.writerow([t["name"],t["host"],t["port"],t["protocol"],t["enabled"],t["rocket_alert"],t["status"],t["detail"],t["ok_count"],t["fail_count"],t["availability"],t["last_ms"],t["updated_at"]])
  return Response(o.getvalue(),mimetype="text/csv",headers={"Content-Disposition":"attachment; filename=pingpilot-export.csv"})
-init();threading.Thread(target=scheduler,name="pingpilot-scheduler",daemon=True).start();threading.Thread(target=global_scheduler,name="pingpilot-global-scheduler",daemon=True).start()
+init();start_background_services()
 if __name__=="__main__":app.run(host="127.0.0.1",port=8219)
